@@ -51,13 +51,14 @@ class JellySpring:
 @export var subdivisions: int = 2
 
 # Właściwości fizyczne (soczysta sprężystość i uginanie, bez deformowania w potworka)
-@export var base_gravity: float = 400.0
-@export var damping: float = 0.985
+@export var base_gravity: float = 420.0
+@export var damping: float = 0.982
 @export var stiffness: float = 0.88
-@export var shape_recovery_stiffness: float = 0.35 # Utrzymywanie kształtu żelki (Shape Matching)
+@export var shape_recovery_stiffness: float = 0.65 # Silne przywracanie pierwotnego kształtu (Shape Matching)
+@export var max_deformation_ratio: float = 0.22    # Maksymalne dopuszczalne odkształcenie punktu (ok. 8.3 px)
 @export var solver_iterations: int = 8
-@export var bounciness: float = 0.38              # Sprężyste, miękkie uginanie i odbicie żelek
-@export var friction: float = 0.65                # Brak zacinania na ścianach
+@export var bounciness: float = 0.35              # Sprężyste, miękkie uginanie i odbicie żelek
+@export var friction: float = 0.65                # Płynny ślizg bez zacinania na ścianach
 
 # Wygląd
 @export var jelly_color: Color = Color(1.0, 0.55, 0.05, 0.88)
@@ -76,6 +77,7 @@ const LOCK_DELAY: float = 0.50 # Czas od kontaktu do zablokowania
 var board_left: float = 0.0
 var board_right: float = 380.0
 var board_floor: float = 760.0
+var support_floor_y: float = 760.0
 
 # Kąt obrotu klocka (do Shape Matching)
 var target_rotation_angle: float = 0.0
@@ -297,16 +299,33 @@ func _update_visual_colors() -> void:
 		outline_node.default_color = outline_glow
 		outline_node.width = outline_width + glow_intensity * 2.4
 
+## Zwraca granice idealnego (restowego) kształtu klocka w bieżącym obrocie
+func get_rest_extents() -> Rect2:
+	if points.is_empty():
+		return Rect2()
+	var min_p = Vector2(999999.0, 999999.0)
+	var max_p = Vector2(-999999.0, -999999.0)
+	for pt in points:
+		var r = pt.rest_local_pos.rotated(target_rotation_angle)
+		min_p.x = minf(min_p.x, r.x)
+		min_p.y = minf(min_p.y, r.y)
+		max_p.x = maxf(max_p.x, r.x)
+		max_p.y = maxf(max_p.y, r.y)
+	return Rect2(min_p, max_p - min_p)
+
 ## Główna pętla fizyki klocka
 func step_physics(delta: float, fall_speed_multiplier: float, other_pieces: Array) -> void:
 	if state == PieceState.CLEARING:
 		_process_clearing(delta)
 		return
 
-	# Użyj stabilnego tłumienia (żelki na dole nadal zachowują elastyczność i uginają się)
+	# Reset poziomu podparcia w bieżącej klatce fizyki
+	support_floor_y = board_floor
+
+	# Użyj stabilnego tłumienia
 	var cur_damping = damping
 	if state == PieceState.SETTLED:
-		cur_damping = 0.96
+		cur_damping = 0.95
 
 	# 1. KROK VERLETA: Aktualizacja pozycji na podstawie pędu i grawitacji
 	var delta_sq: float = delta * delta
@@ -316,24 +335,30 @@ func step_physics(delta: float, fall_speed_multiplier: float, other_pieces: Arra
 			current_gravity *= 5.5
 		else:
 			current_gravity *= fall_speed_multiplier
+	elif state == PieceState.SETTLED:
+		current_gravity *= 0.65
 
 	for pt in points:
 		if pt.is_pinned:
 			continue
 		var vel = (pt.position - pt.prev_position) * cur_damping
-		# Ograniczenie maksymalnej prędkości w dół (zapobiega przebijaniu)
-		if vel.y > 18.0:
-			vel.y = 18.0
+		# Ograniczenie maksymalnej prędkości punktu (zapobiega wybuchom siatki)
+		vel = vel.limit_length(20.0)
+
 		pt.prev_position = pt.position
 		pt.position += vel + (pt.acceleration + Vector2(0, current_gravity)) * delta_sq
 		pt.acceleration = Vector2.ZERO
 
-	# 2. RELAKSACJA WIĘZÓW + SHAPE MATCHING (zapobiega wykrzywianiu i dziwnym deformacjom)
+	# 2. RELAKSACJA WIĘZÓW + SHAPE MATCHING (utrzymywanie i przywracanie kształtu)
 	var is_grounded: bool = false
 	var hit_floor: bool = false
 	var hit_support: bool = false
 
-	var shape_match_rate = shape_recovery_stiffness / float(solver_iterations) * 2.2
+	var effective_stiffness = shape_recovery_stiffness
+	if state == PieceState.SETTLED:
+		effective_stiffness = 0.85
+
+	var shape_match_rate = effective_stiffness / float(solver_iterations) * 2.5
 
 	for _i in range(solver_iterations):
 		_solve_springs()
@@ -348,7 +373,32 @@ func step_physics(delta: float, fall_speed_multiplier: float, other_pieces: Arra
 	# 3. KROK POST-RESOLVE: Sprężyste odbicia i tarcie
 	_post_resolve_contact(hit_floor, hit_support)
 
-	# 4. Logika blokowania klocka (Lock Delay) - aktywowana TYLKO przy podparciu od spodu!
+	# 4. Gwarancja 100% powrotu do oryginalnego kształtu po wygaszeniu drgań
+	if state == PieceState.SETTLED:
+		var max_v_sq = 0.0
+		for pt in points:
+			max_v_sq = maxf(max_v_sq, (pt.position - pt.prev_position).length_squared())
+
+		# Jeśli klocek prawie się nie rusza (wstrząsy wygasły), płynnie dociągamy go do idealnego kształtu
+		if max_v_sq < 0.25:
+			var com = get_center_of_mass()
+			var extents = get_rest_extents()
+			var max_allowed_y = minf(board_floor, support_floor_y)
+			if com.y + extents.end.y > max_allowed_y:
+				com.y = max_allowed_y - extents.end.y
+			if com.x + extents.position.x < board_left:
+				com.x = board_left - extents.position.x
+			elif com.x + extents.end.x > board_right:
+				com.x = board_right - extents.end.x
+
+			for pt in points:
+				var ideal_pos = com + pt.rest_local_pos.rotated(target_rotation_angle)
+				pt.position = pt.position.lerp(ideal_pos, 0.45)
+				if (pt.position - ideal_pos).length_squared() < 0.05:
+					pt.position = ideal_pos
+				pt.prev_position = pt.position
+
+	# 5. Logika blokowania klocka (Lock Delay) - aktywowana TYLKO przy podparciu od spodu!
 	if state == PieceState.FALLING or state == PieceState.LOCKING:
 		if is_grounded:
 			state = PieceState.LOCKING
@@ -363,14 +413,38 @@ func step_physics(delta: float, fall_speed_multiplier: float, other_pieces: Arra
 	_update_polygon()
 	queue_redraw()
 
-## Shape Matching: ściąganie punktów do idealnego kształtu żelki
+## Shape Matching: dynamiczne i bezwzględne przywracanie oryginalnego kształtu żelki
 func _apply_shape_matching(factor: float) -> void:
 	if points.is_empty():
 		return
+
 	var com = get_center_of_mass()
+	var extents = get_rest_extents()
+
+	# Jeśli idealny spód klocka schodziłby poniżej podłogi lub klocka pod spodem,
+	# podciągamy com w górę, aby idealny kształt spoczywał NA podłożu
+	var max_allowed_y = minf(board_floor, support_floor_y)
+	if com.y + extents.end.y > max_allowed_y:
+		com.y = max_allowed_y - extents.end.y
+
+	# Korekta pozycji poziomej względem ścian studni
+	if com.x + extents.position.x < board_left:
+		com.x = board_left - extents.position.x
+	elif com.x + extents.end.x > board_right:
+		com.x = board_right - extents.end.x
+
+	var max_deformation = cell_size * max_deformation_ratio
+
 	for pt in points:
 		var ideal_pos = com + pt.rest_local_pos.rotated(target_rotation_angle)
+		# 1. Ściąganie punktu do idealnej pozycji restowej
 		pt.position = pt.position.lerp(ideal_pos, factor)
+
+		# 2. Bezwzględny kaganek odkształcenia (zapobiega inwersji sprężyn i powstawaniu potworków)
+		var offset = pt.position - ideal_pos
+		var dist_sq = offset.length_squared()
+		if dist_sq > max_deformation * max_deformation:
+			pt.position = ideal_pos + offset.normalized() * max_deformation
 
 func _solve_springs() -> void:
 	for s in springs:
@@ -413,7 +487,7 @@ func _solve_boundaries_position_only() -> bool:
 
 	return touched_floor
 
-## Kolizje między klockami: uginanie żelek pod spodem + brak zatrzymywania w powietrzu
+## Kolizje między klockami: uginanie żelek pod spodem + brak deformowania w potworki
 func _solve_piece_collisions(other_pieces: Array) -> bool:
 	var my_aabb = get_bounding_box()
 	var supported_from_below: bool = false
@@ -435,55 +509,42 @@ func _solve_piece_collisions(other_pieces: Array) -> bool:
 				var closest_edge_info = _find_closest_edge(pt.position, other_poly)
 				var edge_norm: Vector2 = closest_edge_info["normal"]
 				var closest_pt: Vector2 = closest_edge_info["point"]
-				var pen_depth = pt.position.distance_to(closest_pt) + 0.6
+				var pen_depth = pt.position.distance_to(closest_pt) + 0.5
 
 				# Klocek jest podparty od dołu TYLKO gdy normalna wskazuje w górę (edge_norm.y < -0.35)
-				# Zderzenia boczne (spadanie wzdłuż ściany innego klocka) NIGDY nie blokują klocka w powietrzu!
 				if edge_norm.y < -0.35:
 					supported_from_below = true
+					support_floor_y = minf(support_floor_y, closest_pt.y)
 
-				# Rozepchnięcie: ten klocek wypychamy w kierunku normalnej
-				var push_self = edge_norm * (pen_depth * 0.55)
-				pt.position += push_self
-
-				# Klocek pod spodem: uginamy jego punkty w dół/w głąb (ugięcie pod ciężarem!)
-				var push_other = -edge_norm * (pen_depth * 0.45)
-				for other_pt in other.points:
-					var d = other_pt.position.distance_to(closest_pt)
-					if d < cell_size * 0.90:
-						var w = 1.0 - (d / (cell_size * 0.90))
-						other_pt.position += push_other * w
+				# Wypchnięcie punktu na zewnątrz obrysu drugiego klocka
+				pt.position += edge_norm * pen_depth
 
 				# Transfer energii i uderzenia (ugięcie + sprężyste odbicie + świecenie żelki)
 				var v_self = pt.position - pt.prev_position
-				var closest_other_pt: JellyPoint = null
-				var min_d_sq: float = 999999.0
-				for other_pt in other.points:
-					var d_sq = other_pt.position.distance_squared_to(closest_pt)
-					if d_sq < min_d_sq:
-						min_d_sq = d_sq
-						closest_other_pt = other_pt
-
-				var v_other = Vector2.ZERO
-				if closest_other_pt:
-					v_other = closest_other_pt.position - closest_other_pt.prev_position
-
-				var v_rel = v_self - v_other
-				var vn = v_rel.dot(edge_norm)
-				if vn < 0.0: # Zbliżają się do siebie
-					var impulse_mag = -(1.0 + bounciness) * vn
+				var vn = v_self.dot(edge_norm)
+				if vn < -0.15: # Zbliżają się do krawędzi
+					var impulse_mag = clampf(-(1.0 + bounciness) * vn, 0.0, 6.0)
 					var impulse = edge_norm * impulse_mag
 
 					# Odbicie tego klocka
-					pt.prev_position -= impulse * 0.50
-					# Ugięcie i przekazanie pędu na klocek pod spodem!
+					pt.prev_position -= impulse * 0.55
+
+					# Przekazanie ugięcia do najbliższego punktu klocka pod spodem
+					var closest_other_pt: JellyPoint = null
+					var min_d_sq: float = 999999.0
+					for other_pt in other.points:
+						var d_sq = other_pt.position.distance_squared_to(closest_pt)
+						if d_sq < min_d_sq:
+							min_d_sq = d_sq
+							closest_other_pt = other_pt
+
 					if closest_other_pt:
-						closest_other_pt.prev_position += impulse * 0.50
+						closest_other_pt.prev_position += impulse * 0.45
 
 					# Podświetlenie przy zderzeniu żelek!
 					if impulse_mag > 0.8:
-						trigger_collision_glow(clampf(impulse_mag / 6.0, 0.45, 1.0), pt.position)
-						other.trigger_collision_glow(clampf(impulse_mag / 6.0, 0.45, 1.0), closest_pt)
+						trigger_collision_glow(clampf(impulse_mag / 5.0, 0.45, 1.0), pt.position)
+						other.trigger_collision_glow(clampf(impulse_mag / 5.0, 0.45, 1.0), closest_pt)
 
 	return supported_from_below
 
@@ -642,9 +703,10 @@ func trigger_fast_drop() -> void:
 func lock_piece() -> void:
 	state = PieceState.SETTLED
 	is_fast_dropping = false
-	damping = 0.96
+	damping = 0.95
 	friction = 0.85
 	bounciness = 0.25
+	shape_recovery_stiffness = 0.85
 	piece_locked.emit(self)
 
 ## Rozpoczęcie zniknięcia przy czyszczeniu linii
@@ -801,8 +863,8 @@ func _draw_cute_eyes() -> void:
 	var eye_radius = 4.2
 	var pupil_radius = 2.1
 
-	var p1 = com + Vector2(-eye_spacing, -1.0)
-	var p2 = com + Vector2(eye_spacing, -1.0)
+	var p1 = com + Vector2(-eye_spacing, -1.0).rotated(target_rotation_angle)
+	var p2 = com + Vector2(eye_spacing, -1.0).rotated(target_rotation_angle)
 
 	draw_circle(p1, eye_radius, Color.WHITE)
 	draw_circle(p2, eye_radius, Color.WHITE)
